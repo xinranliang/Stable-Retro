@@ -1,0 +1,9 @@
+# Keep source inventory and directory placeholders; exclude ROM/archive data.
+*
+!.gitignore
+!README.md
+!source_manifest.json
+!nes/
+!snes/
+!genesis/
+!.gitkeep
