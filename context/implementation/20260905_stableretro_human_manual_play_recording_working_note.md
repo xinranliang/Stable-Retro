@@ -2,9 +2,11 @@
 
 日期：2026-09-05。源码基线：tag `v1.0.1`，commit `ec7a62718a1f99f34bf5e5d5c57255c9a53df507`。
 
-状态：需求、安装说明、代码实现计划和验证计划已整理；本文中的新增 recording 模块、CLI 参数与测试均为待实现项。本地仓库已按要求切到 `v1.0.1`（detached HEAD）；本次交付 working note 和构建并发配置，尚未创建 Conda 环境或安装/实现 recording 功能。
+状态（2026-09-06 更新）：专用环境和包外采集工具已完成，默认在录制时保存逐帧 emulator state；68 项自动化测试通过，长时真实桌面人工验收仍待完成。最新实现、命令、数据字段和验证边界见 [2026-09-06 实现总结](20260906_stableretro_human_recording_implementation_summary.md)。
 
-实现决策（2026-09-05 补充）：Stable Retro 保持原始 `v1.0.1` package，采集程序放在包外的 `tools/manual_recording/`，通过现有 API、环境 wrapper 和外部 interface 子类完成需求。此前将 recorder 加入 `stable_retro/`、调整包内 interactive 和增加 package extra 的方案，已统一替换为下文的包外实现计划。Stable Retro 首次安装可能需要编译；之后修改采集程序无需重新编译 emulator。
+本文定位：保留 2026-09-05 的设计过程和当时的安装记录，不将历史计划改写成事后验收结果。下文第 1–7 节中的 `tools/manual_recording/`、拟定 CLI/schema、P1–P6“待实现”和 detached HEAD 均指当时状态，不能作为当前运行说明；7.5 为当日随后完成的环境安装和基础测试。实际工具已放到另一个仓库的 `game-agent-stagesft/Stable-retro/human_data_recording/`，入口为 `sretro-record` / `sretro-validate`，代码 commit 为 `9735c7a1`。本仓库目前使用 `xr-gameagent-record` 分支，package 源码仍以原始 `v1.0.1` 为基线。
+
+历史实现决策（2026-09-05）：Stable Retro 保持原始 `v1.0.1` package，采集程序拟放在包外的 `tools/manual_recording/`，通过现有 API、环境 wrapper 和外部 interface 子类完成需求。此前将 recorder 加入 `stable_retro/`、调整包内 interactive 和增加 package extra 的方案，已统一替换为下文的包外实现计划；2026-09-06 又将工具位置调整为上述独立仓库目录。Stable Retro 首次安装可能需要编译；之后修改采集程序无需重新编译 emulator。
 
 ## 1. 目标与交付范围
 
