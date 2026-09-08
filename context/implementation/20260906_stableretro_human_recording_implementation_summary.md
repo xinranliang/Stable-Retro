@@ -2,6 +2,8 @@
 
 状态：采集工具已实现并完成自动化验证；新录制直接保存实际游玩轨迹的 frame、native state、action、reward 和 episode 边界，不依赖事后 replay 才获得 state。本文更新 [2026-09-05 working note](20260905_stableretro_human_manual_play_recording_working_note.md) 的实施状态；旧文保留历史方案，本文件记录实际落地结果。
 
+后续更新（2026-09-07）：已为 828 个 ROM-ready 游戏补齐按钮级 mapping 并逐一运行短程录制审计；存在个别 state 恢复/replay 不一致，不能将录制通过等同于恢复通过。最新覆盖、语义限制和例外见 [全量 action mapping 与录制审计](20260907_stableretro_action_maps_and_recording_audit.md)，本文其余部分保留 2026-09-06 的历史结果。
+
 ## 1. 仓库边界、版本和环境
 
 - Stable Retro 源码：`/scratch/gpfs/CHIJ/xinran/projects/game-envalgm/Stable-Retro`；远端 `xinranliang/Stable-Retro`，分支 `xr-gameagent-record`。基线为 tag `v1.0.1` / `ec7a62718a1f99f34bf5e5d5c57255c9a53df507`，此前环境/ROM 文档提交为 `83c65971`。这次仅更新 `context/`，不修改上游 package 或重新编译。
