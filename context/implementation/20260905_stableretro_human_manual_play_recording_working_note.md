@@ -2,6 +2,8 @@
 
 日期：2026-09-05。源码基线：tag `v1.0.1`，commit `ec7a62718a1f99f34bf5e5d5c57255c9a53df507`。
 
+最新状态（2026-09-09，America/New_York）：包外采集工具支持 `--append` + `--stop-on-done` 多次启动、自动接续 episode 编号；已按用户选择直接沿用 `--state`，新增 session/run/episode 初始化关卡日志，完整自动化回归 146 项通过。第 8 节为 append 实现，第 9 节保留当时只读探索，第 10 节记录初始化日志实现与验证；不新增 `--world` / `--level`。第 11 节新增多-state 游戏名称资产：68 个游戏的 JSON + 汇总索引，此次非 GUI 回归 149 项通过、13 项 GUI 未运行。后续 Stable Retro recording 的 implementation working note 统一补充在本文件；采集工具代码和使用/schema 文档仍保留在独立工具仓库。以下 2026-09-05/06 内容保留为历史记录。
+
 状态（2026-09-06 更新）：专用环境和包外采集工具已完成，默认在录制时保存逐帧 emulator state；68 项自动化测试通过，长时真实桌面人工验收仍待完成。最新实现、命令、数据字段和验证边界见 [2026-09-06 实现总结](20260906_stableretro_human_recording_implementation_summary.md)。
 
 本文定位：保留 2026-09-05 的设计过程和当时的安装记录，不将历史计划改写成事后验收结果。下文第 1–7 节中的 `tools/manual_recording/`、拟定 CLI/schema、P1–P6“待实现”和 detached HEAD 均指当时状态，不能作为当前运行说明；7.5 为当日随后完成的环境安装和基础测试。实际工具已放到另一个仓库的 `game-agent-stagesft/Stable-retro/human_data_recording/`，入口为 `sretro-record` / `sretro-validate`，代码 commit 为 `9735c7a1`。本仓库目前使用 `xr-gameagent-record` 分支，package 源码仍以原始 `v1.0.1` 为基线。
@@ -442,3 +444,337 @@ srun --partition=cpu --nodes=1 --ntasks=1 --cpus-per-task=4 \
 ```
 
 这里 `--no-deps --no-index` 的前提是 7.1 的 Python 依赖已装好，使计算节点编译阶段无需访问包索引。源安装为 in-place/editable；将来切换源码 tag 或 Python 版本时应重新核验/构建，不能移动或删除此仓库后仍期望该环境独立运行。
+
+## 8. 2026-09-09 已实现：单局 CLI 多次启动追加录制
+
+日期基准：America/New_York。用户希望保留 `--stop-on-done`，每次只录一局、退出进程；反复调用同一命令和输出路径时自动生成 `000000`、`000001`、`000002`，不再因目录存在而失败。
+
+### 8.1 实现范围与使用方式
+
+代码仍位于独立仓库的 `game-agent-stagesft/Stable-retro/human_data_recording/`；录制实现 working note 统一维护在本文件，不放到该仓库的 `context/implementation/`。新增显式 `--append`，第一次目标不存在时创建 session，之后对完整关闭的 session 追加新 episode。不带该开关仍拒绝已有目录，不默认覆盖。无需修改 Stable Retro package 或重新安装 Conda 环境，现有 editable 安装直接生效。本次没有 Git stage/commit/push，没有修改用户录制、ROM 或其他项目代码。
+
+```bash
+conda activate stable-retro-recording
+session_dir=/scratch/gpfs/CHIJ/xinran/projects/game-envalgm/human-recordings/mario/session
+
+# 每次重复执行这条命令；保持同一个 session_dir，不再每次 mktemp。
+sretro-record --game SuperMarioBros-Nes-v0 \
+  --record-dir "$session_dir" --record-bk2 --stop-on-done --append
+
+sretro-validate "$session_dir"
+```
+
+### 8.2 关键设计
+
+- `session_lifecycle.py`：Linux `flock` 非阻塞独占写锁，完整旧 session 校验、配置兼容检查、legacy run 迁移和累计 writer 统计。`.recording.lock` 文件保留以避免删除重建造成 inode 竞争；关闭/崩溃时 OS 释放锁，锁文件存在不代表仍占用。
+- 新 session 和 append 都参与同一锁协议。候选目标需有连续、已登记的 episode 目录；有空洞、未登记目录、损坏数据、error/未关闭 manifest 时拒绝，不自动跳过或修复。
+- `state_utils.py` 将资产读取与写入分离：候选 data/scenario/metadata/semantic/Lua 先读入内存计算哈希，只有新 session 才写 assets；追加不会先覆盖旧配置再进行比较。
+- 兼容性要求相同 game/integration、ROM/core/native/Python API identity、按钮布局、action mode、semantic map、core info、归档 assets，以及初始 state 名称/字节。初始化哈希对旧 v1 可从第一局 `initial.state` 描述取得。不同 state/game/scenario 使用独立 session。
+- `TrajectoryRecorder` 从旧 manifest 接续 episode 编号和 `global_step`；旧 episode 内所有文件保持字节不变。新 episode 自己的 step/frame 从 0 开始。
+- 新增 `session.json.runs[]` 保存每次启动的半开 episode/step 区间、状态、实际工具源码/依赖来源、初始化/采集选项、writer 和 performance。顶层来源仍描述首次采集；旧版 live-state session 首次追加时作为 legacy run 0，旧 episode 不改写。
+- 顶层 writer 计数累计，queue capacity/peak 取历史最大值；performance 明确只描述最新 run，不能合并不同启动的延迟百分位数。`--max-steps` 仍按本次进程步数限制。
+- Validator 验证 run/episode/step 对应关系和计数；`monotonic_ns` 仅在同次启动内保持单调，允许跨机器或系统重启后时钟基准变化。
+- GUI 显示接续后的真实 episode 编号。`--stop-on-done` 仍保存 terminal transition/PNG/state、关闭 BK2、排空 writer 后退出，不 reset；不带该开关仍支持单进程多局。
+- Esc 正常退出的 interrupted episode 可保留并追加下一局，不续写旧局。只有 frames + initial.state 的更早格式仍可读，但拒绝混合追加 live states。
+- 追加校验失败或新 episode 开始前失败，不改写旧 manifest。新局开始后出错，旧文件保留，整个 session 标记 error；不支持中途恢复/崩溃自动修复。错误清理也会先关闭 writer 再释放锁。
+
+### 8.3 验证结果
+
+环境：`/home/xl9353/.conda/envs/stable-retro-recording/bin/python`。隔离测试根：`/tmp/stableretro-append-tests.4OOwYYnY`；测试产物不进入 Git，也不保证持久保存。
+
+1. 轻量单元检查：81 passed、30 deselected（当时尚未补入最后一个原生 legacy 测试）。覆盖自动编号、旧数据不变、配置/语义/资产不兼容、初始 state 内容变化、损坏/孤立 episode、旧格式迁移、跨 run 时钟、错误写盘和独立进程锁。
+2. 最终完整回归：**112 passed in 47.03s**，含 Xvfb GUI 和原生 emulator/replay 检查。
+3. Airstriker（Genesis）、SuperMarioBros（NES）、SuperMarioWorld（SNES）各使用三个独立 CLI 进程，重复 `--append --stop-on-done`。每款生成 3 个 run / 3 个 episode，旧 episode 和 assets 哈希不变，静态校验、完整 replay、BK2、导出 state 初始化检查全部通过。
+4. 上述原生重启测试用显式 synthetic scenario 在第一步触发环境 done，使测试有界：每款 3 transitions、6 PNG、6 live states，另有 3 个 initial.state。不是人类通关测试，也不声称验证自然 game-over 条件。
+5. GUI 测试检查追加后 HUD episode=1、只录一局退出、重复 CLI 打开/关闭窗口，以及两局 BK2/replay；全部通过。
+6. 旧版 live-state session 的原生兼容测试：在隔离数据中模拟旧 v1 manifest（没有 runs/初始化哈希），追加后旧文件不变，完整 replay/BK2 通过。早期 frame-only 格式仍可静态校验。
+7. `python -m human_data_recording.prepare_action_maps --check`：828 ready、0 invalid、0 files_needing_update。没有改动或重生成 828 份 mapping；本次没有重新运行全 828 游戏原生审计。
+8. `git diff --check` 无空白错误；CLI `--help` 已显示 `--append`。
+
+最终完整测试命令（在 `game-agent-stagesft/Stable-retro/human_data_recording/` 目录执行；重跑时使用新的临时输出路径）：
+
+```bash
+xvfb-run -a -e /tmp/stableretro-append-tests.4OOwYYnY/xvfb-full-v2.log \
+  -s '-screen 0 1280x960x24' \
+  env RUN_GUI_TESTS=1 PYTHONDONTWRITEBYTECODE=1 \
+  /home/xl9353/.conda/envs/stable-retro-recording/bin/python -m pytest \
+  -q -p no:cacheprovider \
+  --basetemp=/tmp/stableretro-append-tests.4OOwYYnY/full-v2
+```
+
+此前首轮存在一个新增测试断言位置错误，已修正；沙箱内 Xvfb 因不允许 bind 本地 X11 socket 导致 GUI 检查失败，诊断日志已确认。最终使用获准的沙箱外短 CPU/Xvfb 测试运行，保留了完整 GUI 检查。
+
+### 8.4 剩余边界
+
+- 人在真实桌面长时间录多局、海量历史数据追加启动耗时仍需实际验收。追加前会完整扫描旧 PNG/state，复杂度随历史数据量增加。
+- OS advisory lock 约束遵循协议的工具进程；不防止其他程序直接改文件，不是对不可信共享存储的事务系统。
+- 旧版工具不认识跨 run 时间边界；追加后的 session 应使用更新版 validator。
+- 不承诺修复此前六款 state 恢复差异或三款 replay 差异；录制追加与原生确定性问题相互独立。
+
+操作说明已同步到工具 README 和 `docs/recording_format.md`。
+
+## 9. 2026-09-09 探索结论：按 world / level 选择初始关卡
+
+本节为只读探索和后续设计建议，不表示新增了 `--world` / `--level` 参数，也没有修改 Stable Retro package 或采集工具实现。当前已经可以使用 `--state` / `--state-file` 从已有 snapshot 初始化；底层调用 `retro.make(state=...)` / `env.load_state()`，随后 `reset()`。Stable Retro 没有通用的 world/level 选关 API，命名 state 才是跨游戏接口。源码依据为 [retro_env.py](../../stable_retro/retro_env.py) 和采集工具的 `state_utils.py`。
+
+### 9.1 本地 Super Mario Bros state 清单与实测
+
+游戏 ID：`SuperMarioBros-Nes-v0`，默认 state 为 `Level1-1`。通过 `retro.data.list_states(game, retro.data.Integrations.STABLE)` 枚举得到 12 个命名 state，对应 9 个不同 world/level 组合：
+
+| World / Level | 已有 state |
+| --- | --- |
+| 1-1 | `Level1-1`；变体 `Level1-1-99lives` |
+| 1-4 | `Level1-4` |
+| 2-1 | `Level2-1`；变体 `Level2-1-clouds`、`Level2-1-clouds-easy` |
+| 3-1 | `Level3-1` |
+| 4-1 | `Level4-1` |
+| 5-1 | `Level5-1` |
+| 6-1 | `Level6-1` |
+| 7-1 | `Level7-1` |
+| 8-1 | `Level8-1` |
+
+当前没有 `Level1-2`、`Level2-2` 等现成文件，并未覆盖所有 world/level 组合。
+
+对全部 12 个 state 分别执行：创建原生 env、检查 state 被接受、reset、5 步 NOOP、再次 reset。12 个都通过；返回 RGB shape 均为 `[224, 240, 3]`，短步进未触发 done，每个 state 两次 reset 的 RGB 哈希一致。另读取 `env.data.lookup_all()` 和首步 `info`，确认 `levelHi/levelLo` 与上述名称对应，例如 `Level2-1` 为 `1/0`。本地 v1.0.1 的 `reset()` 返回空 info，初始变量校验不能直接依赖 reset info 中存在这两个字段。
+
+本次只做内存中的初始化/短步进检查，没有创建新的人类录制，也没有对所有 12 个 state 执行完整录制/replay 或长时通关验收。
+
+### 9.2 不改代码即可使用的命令
+
+```bash
+conda activate stable-retro-recording
+sretro-record --game SuperMarioBros-Nes-v0 --state Level2-1 \
+  --record-dir /scratch/gpfs/CHIJ/xinran/projects/game-envalgm/human-recordings/mario/world2-level1/session \
+  --record-bk2 --stop-on-done --append
+```
+
+重复同一条命令时，每次从该 snapshot 开始新局、接续 episode 编号。当前 `--append` 要求同一 session 固定初始 state，因此切换关卡应使用独立 session：
+
+```text
+mario/
+  world1-level1/session/episodes/000000、000001、...
+  world2-level1/session/episodes/000000、000001、...
+  world3-level1/session/episodes/000000、000001、...
+```
+
+若后续确实需要在同一 session 混合不同初始关卡，需要另行调整采集工具的初始化兼容规则及校验；每局虽然已经保存独立 initial.state，当前追加 guard 仍会拒绝切换 state。本节未放宽这一限制。
+
+### 9.3 Snapshot 内容与 episode 结束条件
+
+State 保存的是完整模拟器状态，不只是 world/level，也包含位置、生命、时间、分数、敌人等。不能仅凭名称将它视为统一条件的“全新关卡开始”。本次 reset 后实测：
+
+| State | 剩余时间 time | score |
+| --- | ---: | ---: |
+| `Level1-1` | 400 | 0 |
+| `Level1-4` | 252 | 4990 |
+| `Level2-1-clouds` | 237 | 605 |
+
+`Level1-1-99lives` 是不同生命数的变体；`clouds` / `clouds-easy` 也不是普通 `Level2-1` 的等价初始化。正式采集要验收各 snapshot 的画面、位置、生命和时间等条件，而不是只看文件名。
+
+对没有现成 snapshot 的关卡，可先游玩到目标位置，选择实际录制保存的对应 `.state`，通过现有 `--state-file` 初始化；不需要额外 ROM。重用文件仍需相同 ROM/core 的兼容性验证。仅修改 RAM 的 world/level 数字不能保证地图和内部运行状态一致，不作为默认选关方案。
+
+初始化关卡与 episode 结束条件相互独立。当前 Mario 默认 scenario 的 done 条件是 `lives == -1`，`--stop-on-done` 不会在通过 2-1 时自动停止。如果目标变为“每条 demonstration 只覆盖一个关卡”，需要另行定义关卡完成/失败标准和相应 scenario。加载录制 snapshot 后 `reset()` 仍会多推进一帧 NOOP，并重新开始 reward bookkeeping。
+
+### 9.4 后续可选参数设计与验证计划（尚未实现）
+
+建议保留 `--state` 作为通用接口；`--world 2 --level 1` 只是 Super Mario Bros 特定的便捷 selector，通过显式映射解析到 `Level2-1`：
+
+- world 和 level 成对提供，与 `--state` / `--state-file` 互斥。
+- 只接受真实存在、经过核验的 state；缺失关卡明确报错并列出可选项，不静默回退默认关卡。
+- 普通 2-1 默认选择 `Level2-1`，不擅自切换到 clouds / easy / 加命变体。
+- 记录请求的 world/level、实际解析的 state 名称、snapshot 哈希和核验后的实际关卡。不同游戏不复用未经验证的 RAM 字段解释。
+- 不强行统一所有游戏的关卡命名：Mario 3 当前有 `1Player.World1.Level1` 等名称；Mario World 使用 `YoshiIsland1`、`DonutPlains1` 等。
+- 如果未来实现，测试应覆盖有效/缺失/冲突参数、变体选择、实际关卡变量和初始画面、对应录制/replay；追加模式需验证同 state 接续成功、不同 state 按既定策略拒绝。跨关卡单局终止标准需独立验收。
+
+当前建议：先用现有 `--state`，按初始关卡分 session；明确初始条件与终止标准后，再决定是否添加 world/level selector。
+
+## 10. 2026-09-09 实现：沿用 `--state`，记录实际初始化关卡
+
+### 10.1 用户选择与范围
+
+用户决定直接使用 `--state`，并在 recording log 中保留 `world1-level1` 这样的初始化信息。此次只修改包外工具 `game-agent-stagesft/Stable-retro/human_data_recording/`，不修改 Stable Retro v1.0.1 package、ROM 或 integration。不新增 `--world` / `--level`；已有 `--state-file` 和默认 state 路径保留。
+
+`--record-dir` 的含义不变，仍由调用者选择完整 session 根路径；不会自动拼接 world/level 子目录。推荐手动按初始关卡组织目录，重复使用同一个 state + session 路径录多局；改变 state 名称或内容必须另开 session。
+
+```bash
+conda activate stable-retro-recording
+session_dir=/scratch/gpfs/CHIJ/xinran/projects/game-envalgm/human-recordings/mario/world2-level1/session
+
+# 在 desktop/X11/VNC 环境运行；每次执行追加一局。
+sretro-record --game SuperMarioBros-Nes-v0 --state Level2-1 \
+  --record-dir "$session_dir" --append --stop-on-done --record-bk2
+
+sretro-validate "$session_dir"
+sretro-validate "$session_dir" --replay --check-bk2
+```
+
+本机采集工具已 editable 安装，在同一个 `stable-retro-recording` 环境可从任意 cwd 使用，无需重新安装 Stable Retro 或编译 core。上述目录是建议命名，不是本次自动创建的数据目录。
+
+### 10.2 代码与日志结构
+
+实现文件：
+
+- 新增 `src/human_data_recording/initialization.py`：显式 game adapter、post-reset 变量读取和纯函数标签解析；不根据目录或 state 文件名猜测关卡。
+- `recorder.py`：每次真正的 `env.reset()` 返回后，在首个 action 前采集 initialization location；写入本局 `episode.json`，并将各 session/run 第一局的初始化信息写入相应 manifest。所有模拟器调用仍在主线程，不增加 reset、step 或 get_state 调用。
+- `session_lifecycle.py`：append 不把派生的 `location` 当作启动前兼容性字段；继续严格核对初始 state kind/name/raw SHA-256。旧日志没有 location 时仍可追加，旧 episode 不改写、不补造关卡标签。
+- `validate_recording.py`：静态校验初始化 state hash、episode/run 名称与标签关联、标签与保存的变量是否一致；replay 在实际 reset 后重新读取变量，并与录制初始化信息比较。
+- `manual_play.py`：沿用原有 `--state` 参数，仅更新 help。工具 `README.md` 和 `docs/recording_format.md` 更新使用方式与 schema；不在工具仓库新增 implementation working note。
+
+记录位置：`session.json.initialization`、`session.json.runs[i].initialization`、`episodes/NNNNNN/episode.json.initialization`。原有 kind/name/raw SHA-256 保留，新增 `location`；例如 World 2-1：
+
+```json
+{
+  "kind": "integration_state",
+  "name": "Level2-1.state",
+  "raw_sha256": "<pre-reset initial.state 的解压后 SHA-256>",
+  "location": {
+    "phase": "post_reset",
+    "status": "resolved",
+    "label": "world2-level1",
+    "world": 2,
+    "level": 1,
+    "source": "integration_variables:SuperMarioBros-Nes-v0:v1",
+    "variables": {"levelHi": 1, "levelLo": 0, "lives": 2, "time": 400},
+    "reason": null
+  }
+}
+```
+
+例子只展示部分 variables；实际保留该 Mario integration 的全部 `env.data.lookup_all()` 结果，包括 coins、score、scrolling、xscroll 等。Stable Retro 的 reset info 仍原样保存为 `{}`，不会以初始化变量替换它。
+
+时间边界必须区分：initialization raw SHA-256 标识 **reset 输入** `initial.state`；location 描述 **reset 返回后** 的 frame[0]/state[0]。Stable Retro 本身 reset 会推进一帧 NOOP，本改动不额外推进。location 是初始关卡标签，不随游玩跨关而改变；逐步的实际游戏变量仍在 transition.info 中。
+
+`Level1-1` 和 `Level1-1-99lives` 都可能标记 `world1-level1`，但完整名称/hash 及初始 lives/time 不同，不能当作同一种 snapshot。外部 state 即使叫 `00000001.state`，Mario adapter 仍从实际变量确定关卡；可能是关卡中途状态，不代表干净的关卡开局。
+
+顶层 initialization 描述整个 session 第一局，各 run 描述该次调用第一局；每局完整上下文以自己的 `episode.json` 为准。transition 不重复写同样的初始化 metadata，通过 episode_id 与 episode.json 关联即可构造带初始关卡标签的数据样本。
+
+### 10.3 已验证与未知的边界
+
+目前只对 `SuperMarioBros-Nes-v0` 启用已核实规则：`world=levelHi+1`、`level=levelLo+1`，有效范围为 1–8 / 1–4。不将规则套到 Mario 3、Super Mario World 或其他游戏。其他游戏仍有准确 state 名称/hash，但 location 的 label/world/level/source 为 null，status=unavailable、reason=unsupported_game、variables={}。Mario 缺少变量或值越界时保留原变量，并标记 missing_or_invalid_level_variables，不回退猜测 World 1-1。
+
+本地 12 个 Mario 命名 state（9 个不同 world/level）全部覆盖此次有界录制测试；名单见 9.1。仍不是任意 world/level 都有现成 snapshot；缺少 Level1-2 等关卡时需要另行准备兼容 state。本次没有修改 scenario 或 episode 结束定义，仍以原有 terminated/truncated 为准。
+
+### 10.4 验证计划与本次结果
+
+采用单元校验 → 真实 Mario 快照专项 → 全套 CPU/Xvfb 回归；数据全部写新建 `/tmp` 目录，不覆盖旧录制。环境 Python：`/home/xl9353/.conda/envs/stable-retro-recording/bin/python`。
+
+- 单元回归：`100 passed, 46 deselected in 2.99s`。包含已知/未知游戏解析、缺失/无效变量、初始化日志损坏检查，以及原有录制/append 测试。
+- Mario 专项：`15 passed, 19 deselected in 5.95s`。全部 12 个命名 state 各实际 reset + 3 个 NOOP transition、保存 live PNG/state/BK2，再静态校验和 replay/BK2 对齐；另覆盖数字文件名 custom state、连续三次 CLI append 与换 world 拒绝、伪造一致标签后 replay 必须拒绝。
+- 完整回归：`146 passed in 54.78s`，包含真实 NES/SNES/Genesis 录制、GUI/Xvfb、stop-on-done、append、旧日志兼容、replay、BK2 和 state initialization 原有测试。未跳过 GUI；Xvfb 需要本地 X11 socket 权限，以批准的沙箱外短 CPU 命令运行。
+- 两个 repo 的 `git diff --check` 通过。尚未 commit/push，保留原有 append 改动和其他无关工作。
+
+验证产物根：`/tmp/stableretro-initialization-tests.HFlRSj/`，子目录 `unit/`、`mario/`、`full/`；Xvfb 日志 `xvfb.log`。专项 World 2-1 的示例日志：`mario/test_all_local_mario_states_re3/recording/episodes/000000/episode.json`。
+
+完整回归命令（重跑需替换 basetemp 为未使用的新目录）：
+
+```bash
+xvfb-run -a -e /tmp/stableretro-initialization-tests.HFlRSj/xvfb.log \
+  -s '-screen 0 1280x960x24' \
+  env RUN_GUI_TESTS=1 PYTHONDONTWRITEBYTECODE=1 \
+  /home/xl9353/.conda/envs/stable-retro-recording/bin/python \
+  -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/stableretro-initialization-tests.HFlRSj/full
+```
+
+验收限制：12-state 专项是短时程序输入，不是人工打通 12 个关卡；Xvfb 回归不代替真实 desktop 长时人工验收。本次没有重跑 828 游戏全量 native audit，也未声称其他游戏已有 world/level adapter。静态校验只能检查已记录证据的内部一致性；与真实 snapshot 是否一致由 replay 进一步检查。已有日志不自动升级或补标签。
+
+## 11. 2026-09-09：多-state 游戏名称资产与可重复检查
+
+### 11.1 全量检查结果与收录范围
+
+按用户要求，在采集工具 `assets/` 中按游戏存放多个预置 state 的名称；不复制 `.state` 文件或 ROM，不修改 Stable Retro integration。遍历安装中的 `Integrations.ALL`（stable/experimental/contrib；当前没有注册 custom 路径），以 `retro.data.list_states()` 的公开结果为准：
+
+| 范围 | 游戏数 | 公开 state 数 | 多-state 游戏数 |
+| --- | ---: | ---: | ---: |
+| 全部 integrations | 1,033 | 1,807 | 68 |
+| ROM ready | 828 | 1,573 | 57 |
+| 本次按游戏生成的目录 | 68 | 842 | 68 |
+| 目录内 ROM ready 子集 | 57 | 802 | 57 |
+
+全部 1,033 个游戏都有至少一个公开 state；未导入 ROM 的 205 个游戏不能因为有 state 就被视为可运行。828 个 ready 游戏的 ROM 哈希重新验证通过，无 invalid ROM；其中 771 个只有一个公开 state，因此本次不生成单独文件，但它们仍然支持 `--state`。
+
+目录覆盖全部 68 个多-state 游戏，包含 stable 59、experimental 4、contrib 5；11 个尚无 ROM 的游戏也保留清单，明确标记 `rom_ready_at_scan=false`。不把这些游戏计入当前 ready 集合。
+
+先前全量只读检查对 1,807 个公开 state 及 14 个下划线开头的内部 state 执行 gzip EOF/CRC、解压非空检查，全部通过；内部 state 不放入本次公开目录。生成器重新检查目录内 842 个 state。完整只读报告曾输出于 `/tmp/stableretro-preloaded-states-audit.UcjTpN/inventory.json`；新的 source assets 不依赖该临时报告，直接扫描 live integrations。
+
+### 11.2 文件结构与字段
+
+工具根：`/scratch/gpfs/CHIJ/xinran/projects/game-envalgm/game-agent-stagesft/Stable-retro/human_data_recording`。
+
+```text
+src/human_data_recording/
+  prepare_state_catalog.py
+  assets/
+    state_catalog.json                       # 总索引，游戏文件哈希和汇总
+    preloaded_states/
+      README.md                              # 字段、范围和使用说明
+      SuperMarioBros-Nes-v0.json              # 12 个公开 state
+      SuperMarioBros3-Nes-v0.json             # 6 个
+      SuperMarioWorld-Snes-v0.json            # 25 个
+      SonicTheHedgehog-Genesis-v0.json        # 17 个
+      ...                                    # 共 68 个游戏 JSON
+tests/test_state_catalog.py
+```
+
+每游戏 JSON：game、integration、system、`state_count`、`rom_ready_at_scan`、`rom_sha1`、`states`、单玩家默认选择、原 metadata 默认配置、`issues`。其中：
+
+- `states[].name` 是直接传给 `--state` 的名称，例如 `Level1-1`。
+- `states[].filename` 是实际文件名，例如 `Level1-1.state`；保留精确大小写。
+- `states[].integration` 记录 state 所在的 integration 类别。
+- `states[].raw_sha256/raw_size/gzip_integrity` 是解压后摘要、字节数和 gzip 完整性结果，不代表 native 接受该 state 或 replay 已通过。
+- `single_player_default` 按 `RetroEnv(players=1)` 的优先级选择：先取非空 `default_player_state[0]`，否则取 `default_state`；记录 name/filename/source/status，不自行修正拼写。
+- `metadata_default_state` 与 `metadata_default_player_states` 保留原始配置，用于核对默认优先级和已知异常。
+
+索引 `state_catalog.json.games[game]` 提供相对 JSON 路径、文件 SHA-256、state 数、ROM-ready 标记和问题列表；summary 记录全部扫描范围与目录范围的不同计数。生成结果确定，不嵌入机器绝对路径或变化的生成时间。ROM readiness 是生成时的本地安装快照，不保证新机器环境，日期依据本记录及 Git 历史。
+
+默认引用异常保留为 `single_player_default_missing_file`：`NHL94-Genesis-v0` 和 `NHL941on1-Genesis-v0` 都配置了末尾多句点的 `PenguinsVsSenators.start.`；前者 ROM ready，后者缺 ROM。正确的 `PenguinsVsSenators.start` 仍列在各自 states 中，没有修改原 metadata。
+
+### 11.3 查询、刷新与采集行为
+
+```bash
+conda activate stable-retro-recording
+
+# 只读：重新扫描并检查 source assets 是否一致；不同则 exit 1。
+python -m human_data_recording.prepare_state_catalog --check
+
+# 明确刷新：只更新每游戏 JSON 和汇总 JSON，不复制/删除 ROM 或 state。
+python -m human_data_recording.prepare_state_catalog --write
+```
+
+不加参数只预览统计，不写文件。`--assets-dir` 可指定独立输出目录。生成器在所有扫描/规划完成后才写 JSON，重复生成内容不变时不会重写；发现目录中的多余/过期 JSON 会报错要求人工复核，不自动删除。生成 JSON 不承载手写语义标签，刷新可以替换其元数据内容。
+
+查询一个游戏的名称，不依赖当前工作目录：
+
+```python
+import json
+from importlib.resources import files
+
+asset = files("human_data_recording").joinpath(
+    "assets", "preloaded_states", "SuperMarioWorld-Snes-v0.json"
+)
+game = json.loads(asset.read_text())
+print("\n".join(state["name"] for state in game["states"]))
+```
+
+采集 CLI 不以目录作为允许列表，也不会自动选 state；仍直接使用 Stable Retro 的已有 integration。用户选择 `states[].name` 作为 `--state`，experimental/contrib 游戏使用相应 `--integrations`。原有 initialization 记录规则、append 固定初始 snapshot 约束、world/level adapter 和 stop-on-done 语义均不改变。
+
+### 11.4 验证、打包与限制
+
+- 新增目录专项：`16 passed in 12.86s`。验证默认优先级、错误/空 gzip、确定性、只读 preview/check、write 幂等、多余文件不删除、安全文件名，以及全部 source JSON 与 live integrations/哈希一致性。
+- 非 GUI 回归：`149 passed, 13 deselected in 71.23s`，包括现有录制、append、初始化日志、真实 emulator replay/BK2 和 action catalog 测试。本次没有修改 UI 或录制流程，因此未重复运行 GUI；此前第 10 节的 146 项完整回归包含 GUI。
+- `python -m human_data_recording.prepare_state_catalog --check`：69 份 JSON 全部一致，`files_needing_update=0`。
+- 与前一轮独立全量 inventory 交叉比较：68 个游戏的 state 名称、state hash、ROM-ready 状态及默认引用结果全部一致。
+- 在 `/tmp` 的源码副本构建 wheel，确认包含 68 个每游戏 JSON、总索引和 README，内容逐字节与 source assets 一致；不含 ROM、`.state`、BK2、PNG 或 JSONL。没有重新安装环境，也没有在工具 repo 留下本次 build 产物。
+- `pyproject.toml` 补充 package-data；`.gitignore` 只新增这两个 JSON 路径的例外，避免父 repo 的全局 JSON ignore 隐藏 source assets。已用 `git check-ignore -v` 核对例外生效，`git diff --check` 通过。尚未 stage/commit/push。
+
+验证临时目录：`/tmp/stableretro-state-catalog-tests.THs3rz/`（unit、non-gui、package、wheels）。wheel SHA-256：`cde1fc32d9a291a31af78665c71c3d816bfc54df65b0104ecc0d4a442a2c92c1`。
+
+边界：名称目录不是 state 二进制备份、world/level semantic mapping 或每个快照的运行认证。某些名称表示游戏中途、多人比赛、角色或生命数变化，不保证适合单玩家 demonstration；正式使用仍需对所选 state 验证实际初始化/录制/replay。本次没有执行 842 个 state 的 native 全量测试，没有更改 ROM、integration、场景或旧录制数据；implementation working note 只补充于本文件。
+
+## 12. 2026-09-09 Git 交付记录
+
+用户要求分别提交/推送工具目录与本文件。采集工具已在 `game-agent-stagesft` 的 `xr-sft` 分支创建本地 commit `70f324f2a5c67a906e571ad795ff52414f0fff8a`：`feat(recording): append episodes and catalog initialization states`。仅包含 `Stable-retro/human_data_recording/` 内已校验的 90 个文件（其中 68 个游戏 state JSON + 1 个索引）；没有加入 ROM、state 二进制、录制产物、其他工程修改或未跟踪文件。
+
+本次提交前 `prepare_state_catalog --check` 再次通过（0 个待更新 JSON），staged diff 空白检查及范围检查通过。第 10/11 节的“尚未 commit/push”描述各实现验证结束时的历史状态，以本节的后续交付记录为准。
+
+在本记录提交准备时，采集工具尚未推送：自动安全审核要求用户明确确认 remote `https://github.com/Chengshuai-Shi/game-agent.git` 的 `xr-sft` 分支；此外 HTTPS fetch 无可用凭据，已有 SSH 认证返回 publickey denied。没有更改 remote/认证配置，也没有使用 force push。本文件在当前 `Stable-Retro` repo 的 `xr-gameagent-record` 分支单独提交；最终远程同步状态应以实际 push 结果及 remote ref 为准，不能将本地 commit 当作已上传。
