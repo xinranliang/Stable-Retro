@@ -778,3 +778,159 @@ print("\n".join(state["name"] for state in game["states"]))
 本次提交前 `prepare_state_catalog --check` 再次通过（0 个待更新 JSON），staged diff 空白检查及范围检查通过。第 10/11 节的“尚未 commit/push”描述各实现验证结束时的历史状态，以本节的后续交付记录为准。
 
 在本记录提交准备时，采集工具尚未推送：自动安全审核要求用户明确确认 remote `https://github.com/Chengshuai-Shi/game-agent.git` 的 `xr-sft` 分支；此外 HTTPS fetch 无可用凭据，已有 SSH 认证返回 publickey denied。没有更改 remote/认证配置，也没有使用 force push。本文件在当前 `Stable-Retro` repo 的 `xr-gameagent-record` 分支单独提交；最终远程同步状态应以实际 push 结果及 remote ref 为准，不能将本地 commit 当作已上传。
+
+## 13. 2026-09-14：显式 `--state` 限制单关，通关也触发 done
+
+### 13.1 用户确认的语义与支持范围
+
+用户要求：显式给出 `--state`、从指定关卡初始化时，episode 只能覆盖该关；`--stop-on-done` 不只在 game over 时退出，通关也要保存并退出。对于尚无可靠通关适配器的其他游戏，用户明确选择**拒绝启动，不退化为跨关录制**。
+
+本节更新第 10/11 节的历史行为描述；名称目录没有删除或缩减，但“存在 state 名称”不再等于“recorder CLI 支持该游戏的单关采集”。Stable Retro 本体的 state 初始化 API 不受影响。
+
+- `--state NAME`：启用单关 episode policy；目前支持 `SuperMarioBros-Nes-v0`。其余游戏在创建 emulator/输出前给出明确错误。
+- 不指定 `--state`：维持默认 snapshot + 原 scenario 的整局录制语义，不自动限制单关。
+- `--state-file`：继续作为独立的外部 snapshot 初始化接口，不隐式升级成单关模式；不能借此声称不支持的游戏已有单关保证。
+- `--stop-on-done`：在所选策略产生 done 后关闭窗口，不 reset；没有该开关则 done 后 reset 回原初始 snapshot，再开始新 episode。
+- 初始关卡根据 reset 后的真实 RAM 识别，不解析 `Level2-1-clouds` 等名称猜测位置。启动 snapshot 必须是尚未完成的可玩关卡。
+
+使用示例（必须使用新的 session 目录）：
+
+```bash
+conda activate stable-retro-recording
+sretro-record --game SuperMarioBros-Nes-v0 --state Level1-1 \
+  --record-dir /path/to/NEW-mario-single-level-session \
+  --append --stop-on-done --record-bk2
+```
+
+退出后重复同一命令追加下一条单关 episode。旧整局 session 即使也是从 Level1-1 开始，也不能混入新策略数据；程序会拒绝不兼容的 append，不修改旧文件。
+
+### 13.2 实现与停止边界
+
+实现仍位于独立的 `game-agent-stagesft/Stable-retro/human_data_recording`，没有修改 Stable Retro package、ROM、integration 的 `data.json` / `scenario.json`。
+
+- 新增 `episode_boundary.py`：版本化策略、SMB RAM 证据采样和纯结束判定；recording、static validation、replay 共用。
+- `manual_play.py`：显式 state 选择策略、unsupported fail-fast、初始 snapshot 预检；不新增需要用户额外记忆的单关 CLI 开关。
+- `recorder.py`：step 后合并原生 done 与单关终止条件，保存最后一条 transition/PNG/live state，关闭 BK2、排空 writer，再结束 episode；无额外 emulator step。
+- `interface.py` 与 headless loop：保留具体结束原因，`--stop-on-done` 下停止当前 update 循环，不多采一帧、不 reset。
+- `session_lifecycle.py`：append 比较 policy，run 留存 policy；禁止把新单关模式混入旧不限关记录。
+- `validate_recording.py`：验证 policy/证据/结束原因一致性；replay 根据真实 RAM 重新判定，不直接相信记录下来的单关 done。
+
+Mario v1 策略：
+
+| 条件 | 结果 / end_reason |
+| --- | --- |
+| lives 降低，但未到 -1 | 本身不结束；不改变原 scenario 的其他 done 条件 |
+| lives == -1 | `game_over`，terminated=true |
+| game mode 为胜利模式，或处于旗杆滑落且存在旗杆/Bowser 对象 | `level_complete`，terminated=true |
+| world/level 离开 reset 的初始关卡，但没有明确通关事件 | `level_changed`，terminated=true；不作为成功通关证明 |
+| 原 scenario 的其他 terminated/truncated | `environment_done`；保留原 flags |
+| Esc / max_steps 等提前退出 | 保持 interrupted，不伪造 done |
+
+旗杆检测以 Mario RAM 的 `0x0770`、`0x001D`、`0x0016..0x001A` 等为依据；world/level/lives 使用已验证的 `0x075F` / `0x075C` / `0x075A`。旗杆对象条件用于区分滑旗与藤蔓攀爬；只看 player state 不足以区分。参考：[gym-super-mario-bros 的 SMB 状态判定实现](https://github.com/Kautenja/gym-super-mario-bros/blob/master/gym_super_mario_bros/smb_env.py)。规则只用于当前 SMB integration，不推广到其他 Mario ROM 或 emulator。
+
+普通旗杆通关在关卡编号改变之前结束，保存触发通关的实际帧，不继续完整旗杆/入城堡动画。城堡使用 victory mode。`level_changed` 是 warp 等边界的兜底，可能保留第一帧切关画面，但检测后不执行下一关的后续动作。
+
+### 13.3 日志、replay 与兼容性
+
+session/run 新增 `episode_policy={"version":1,"scope":"initial_level","adapter":"smb1-nes-v1"}`。每条 transition 新增 `episode_boundary`，包括初始关卡、当前 RAM 证据、`environment_terminated/environment_truncated`、`level_complete/level_changed` 和 `reason`。terminal episode 的 `final_boundary` 保存最后一条证据，`end_reason` 区分通关、game over、关卡变化和原 scenario done。
+
+新单关日志的 `terminated` 是**采集任务**的终止标志，可在原生环境未 done 时为 true；原始 flags 明确保存在 `episode_boundary`。reward、`info`、有效/请求动作、RGB 与 emulator snapshot 不修改。最后一张 live state 在单关任务中标为 terminal，不进入默认非 terminal 初始化抽样池。
+
+旧记录没有 policy，继续使用原环境语义 replay；不因旧日志包含 state 名称就追溯添加规则。策略版本不匹配会拒绝验证。`schema_version=1` 保持可读的增量扩展，但旧版 validator 不认识新的终止语义，新数据必须用更新后的验证器处理。
+
+原生 `.state` 不包含 Python 层的单关策略；拿去初始化其他环境时，需同时恢复任务 policy 才能保持同样的终止语义。Mac/Linux runtime identity 的严格检查保持原样，本次不是跨平台 state 兼容性改造。
+
+### 13.4 验证结果与范围
+
+- 12 个本地 Mario 命名 state 的 pre-reset / post-reset 单关起点预检全部通过，包括 99 lives、clouds 变体和 Level1-4。
+- 真实正常按键轨迹：从 Level1-1 开始，**第 1,443 步**达到旗杆；world/level 仍为 1-1，原生 terminated/truncated 都是 false，新策略给出 `level_complete`。未写 RAM、未修改 ROM、未人为强制 done；这段是自动化按键测试，不冒充人工 demonstration。
+- 上述录制保存 1,443 transitions、1,444 PNG、1,444 live states，另有 initial.state；完整静态检查、BK2、严格 replay 和抽样 state 恢复检查通过。禁止 terminal 后再次 step，无第二个 episode。
+- 相同按键在无单关 policy 的原有模式中不停止，继续推进到 1-2，验证旧行为没有被全局改变。
+- 真实按键死亡轨迹经历 lives 2、1、0、-1，仅最后 game over 结束；录制与 replay 通过。
+- GUI：Xvfb 下 **14 passed, 181 deselected**，包括真实近旗杆 snapshot 的窗口关闭、writer 收尾、无额外 step/reset 和原有窗口操作回归。最初沙箱内 Xvfb 无法建立显示连接，获准在支持本地显示 socket 的执行环境重跑后通过；未安装或升级依赖。
+- 非 GUI 全量回归：**181 passed, 14 deselected in 91.07s**；包含新策略单元、策略/证据篡改拒绝、重复 append、旧数据兼容，以及现有 action/state catalog 和 recorder 测试。与 GUI 的 14 项合计 **195 项通过**。
+
+验证产物：`/tmp/stableretro-level-scope.SgxUvY/`，包括 `non-gui.log`、`gui.log`、各测试生成的 session 和 replay。该目录是临时验证产物，不提交 Git。
+
+尚未逐个实际通关 Mario 的全部 worlds/levels；普通管道、藤蔓、warp 和城堡胜利的分支有判定逻辑测试，但不冒充所有这些场景都已完成真实人工验收。未在 Mac 实机测试本次更新；Mac 采集者需更新 recorder 源码/安装包，Stable Retro 1.0.1 无需重装。未新增其他游戏适配器，未修改既有录制数据，也未 commit/push。
+
+## 14. 2026-09-14：修复 Apple Silicon / Pyglet 的窗口退出生命周期
+
+### 14.1 问题与源码证据
+
+用户在 Mac 实机报告：游戏和通关判定已完成，但关闭窗口时抛出 `AttributeError: ... platform_event_loop`。本地安装的 Pyglet 为 1.5.31；核对该版本源码，`ManualInterface.run()` 自己处理窗口事件，并没有调用 `pyglet.app.run()`。`CocoaAlternateEventLoop.run()` 才为实例设置 `platform_event_loop`，而它的 `exit()` 直接访问这个属性。`Window.close()` 通知 `app.event_loop`，默认 `on_window_close` 又会在最后一个窗口关闭时调用 `exit()`，于是触发未初始化属性的异常。
+
+[Pyglet event loop 官方说明](https://pyglet.readthedocs.io/en/latest/programming_guide/eventloop.html) 描述了默认的最后窗口退出行为；[事件分发说明](https://pyglet.readthedocs.io/en/latest/modules/event.html) 提供 handler stack 和 `EVENT_HANDLED` 的公共接口。上述链接是 latest 文档；具体 Cocoa 缺失属性的结论与修复依据来自实际安装的 **1.5.31 源码**，不是假定 latest 与旧版本实现一致。
+
+另外，旧 `manual_play.py` 在 recorder/session 收尾之后，无保护地调用 `interface.close_window()`，导致 GUI 清理失败时已有 `status=complete`，进程却带未捕获异常退出。
+
+### 14.2 实现与失败语义
+
+只修改独立采集工具，不改 Stable Retro core、Pyglet 安装源码、ROM、integration 或依赖版本。
+
+- `interface.py::close_window()`：物理关闭窗口期间，临时向 app event loop 注册 `on_window_close` handler。仅当通知属于自己的窗口、且 app loop 未运行时，返回 `EVENT_HANDLED`，阻止落到未启动的 Cocoa `exit()`。其他窗口的通知、已运行 app loop 的通知仍继续传播。通过 `finally` 移除自己的 handler，不替换全局 `exit()`，也不伪造 `platform_event_loop`。
+- 窗口成功关闭后才设置 `_window_closed`；重复正常关闭是 no-op，失败不伪装成功，且不会遗留临时 handler。
+- `RecordingEnv.close()` 新增可选 keyword-only `before_session_close` 回调，不引入 GUI 依赖。正常流程先完成 episode、关闭 BK2 并 flush 数据队列，再执行窗口关闭回调，最后关闭 writer、提交 session/run 最终状态、释放锁和 emulator。录制收尾失败时仍尝试窗口清理；窗口失败时也仍尝试 writer/session/emulator 收尾。
+- `manual_play.py` 将窗口关闭交给上述回调，纳入现有受控错误处理；不再从外层 `finally` 单独抛出窗口异常。意外窗口异常打印 `Recording cleanup failed`，CLI 返回 1，session 与当前 run 为 `error`。原始采集错误存在时优先保留原错误；`end_reason` 保留游戏退出原因，错误详情在 `error`。
+
+成功退出顺序为：`terminal transition / interrupted episode → BK2 close + writer flush → window close → writer close + session/run final status → resource release`。终止帧、动作、reward、live state 和单关判定都不改，不额外 step/reset。
+
+如果 episode 已经成功结束、但窗口清理失败，episode 可以保持 `complete` / `interrupted`，而 session/run 为 `error`：这是数据片段状态与整个采集进程状态的区别。已写好的文件不删除、不覆盖；validator 和 append 继续拒绝 error session，不自动将其修改为 complete 或声称通过验证。未写盘的内存数据、writer 自身损坏等情况也不能仅凭有文件就认定可用。
+
+### 14.3 验证结果与边界
+
+验证环境：Linux x86_64、Python 3.12、Stable Retro 1.0.1、Pyglet 1.5.31；窗口测试使用 Xvfb，没有升级/重装依赖。
+
+- 新增 `unstarted_cocoa_loop` fixture：继承真实 Pyglet EventLoop/dispatcher，模拟 1.5.31 Cocoa `exit()` 访问尚未初始化属性的行为。对真实 Xvfb 窗口直接执行旧版关闭路径，确认能够复现同一 `AttributeError`，不是只验证一个永远不报错的 mock。
+- 修复后，CLI 的 Esc、窗口 `on_close` 事件、scenario done 自动退出均正常返回 0；只保存一个 episode，writer 线程关闭，session/run 为 complete，未调用未启动的 Cocoa-like `exit()`。这些录制均通过 static、严格 replay、BK2 和抽样 replay-state initialization 校验。
+- Mario 的真实近旗杆 snapshot 由正常按键轨迹生成；单关通关退出同样在 Cocoa-like loop 下通过，无额外 step/reset，保留 terminal transition/state，并通过 static/replay/BK2/抽样 replay-state initialization。该路径不是用强制 scenario done 冒充 Mario 通关。
+- 覆盖 handler 范围/恢复、已有 handler 不丢失、运行中的 app loop 不被接管、重复关闭、失败后可重试，以及 CLI 在 play-only / recording、原始运行错误叠加清理错误时的行为。
+- 注入窗口关闭失败：验证数据 flush 发生在窗口关闭之前，session 在回调期间尚未最终 complete；回调失败后 writer/emulator 仍关闭，CLI 受控报错，session/run 标 error。额外覆盖已通关 terminal episode，确认不会丢掉已保存的终止数据。
+
+执行记录：非 GUI 全量 **188 passed, 20 deselected in 89.73s**；GUI 全量 **20 passed, 188 deselected in 7.67s**。随后补充 terminal 参数组合，重跑 recorder/CLI 收尾测试 **21 passed in 1.03s**，包含新增的 2 个 terminal 参数用例；当前共 210 个测试用例已覆盖通过（190 非 GUI、20 GUI，非 GUI 结果来自全量与增补检查）。首轮新 GUI 测试的三个失败来自测试调用 replay 时漏传 `dump_states` / output 参数，窗口关闭本身已成功；修正测试调用后通过，未放宽 validator。
+
+产物位于 `/tmp/stableretro-cocoa-close.DcuiL5/`：`non-gui.log`、`gui-rerun.log`、`cleanup-final.log` 及对应 session/replay；首轮 `gui.log` 保留失败记录。产物不加入 Git。工具 README / recording_format 同步说明退出和错误状态语义；implementation working note 仅更新当前 Stable-Retro repo 本文件。
+
+**未在 Apple Silicon 实机执行本次修复。** Xvfb + Cocoa 行为模拟能覆盖已定位的 Python 退出回调错误，不能替代原生 Cocoa 窗口、输入和桌面验收。未改用户旧录制，也未 commit/push。
+
+### 14.4 Mac 本地复测步骤
+
+将更新后的采集工具源码同步到 Mac；本次关键源文件是 `interface.py`、`manual_play.py`、`recorder.py`。如果本地使用 editable install，更新对应源码即可；若使用普通安装，需要重新安装更新后的工具包。不要修改 site-packages 内的 Pyglet，也不需要重装 Stable Retro、ROM 或 conda 环境。先在本地采集环境确认 Python 导入的是更新后的工具路径：
+
+```bash
+python -c 'import human_data_recording.interface as ui; print(ui.__file__)'
+gui_check_root=$(mktemp -d /tmp/stableretro-window-check.XXXXXX)
+sretro-record --game SuperMarioBros-Nes-v0 --state Level1-1 \
+  --record-dir "$gui_check_root/session" --append --stop-on-done --record-bk2
+echo $?
+```
+
+保持同一个终端和 `gui_check_root`，总共运行上述 `sretro-record` 命令三次（包含示例中的第一次）：第一次按 Esc；第二次点击窗口关闭按钮；第三次正常完成 1-1，等待自动关闭。每次返回后立即检查退出码应为 0、没有 traceback；三次分别产生 `000000` / `000001` / `000002`。前两条应为 interrupted / user_exit，第三条应为 complete / level_complete；第三次若先 game over，则测试到了另一条 done 路径，仍需再录一次真正通关验证。
+
+```bash
+sretro-validate "$gui_check_root/session"
+sretro-validate "$gui_check_root/session" --replay --check-bk2 \
+  --dump-states --check-state-initialization \
+  --replay-output "$gui_check_root/replay"
+```
+
+`replay` 输出目录必须是新目录；重复验证请使用另一个名字。上述 native replay/state 检查先在产生数据的同一 Mac 环境进行，不能用 Della 上不同架构的 runtime 替代认证。`--check-state-initialization` 检查的是 replay 导出的 states，静态检查同时核对录制时保存的 live states 文件/hash；不混淆二者。
+
+对于本次更新之前已报过窗口关闭错误的旧 session，可能已经完整写盘，但仍应在原 Mac 环境运行 static/replay/BK2 检查后再使用；本修复不会追溯改写旧数据的状态或内容。
+
+### 14.5 2026-09-15（America/New_York）：Mac 实机反馈与 Git 交付
+
+用户明确确认：**已在本地验证针对 Cocoa AttributeError 的修复成功**。这是后续实机反馈，更新 14.3 中 2026-09-14 的“尚未实机验证”历史状态。此次反馈确认该异常已消除；用户尚未分别提供三种退出路径和 static/replay/BK2/state 报告，因此不据此扩大为这些项目均已在 Mac 完整验收。
+
+用户同意 Mario 单关功能与 Mac 窗口退出修复一起提交，但拆成独立 commits；不纳入本地采集/上传 Della 的计划文档、ROM、录制数据或其他工程内容。
+
+采集工具在 `game-agent-stagesft` 的 `xr-sft` 分支创建两个本地 commits（按历史顺序）：
+
+- `93a11c1d310f36a64de42847fb0f6437af8da1a1` — `fix(recording): safely close manually driven pyglet windows`；9 个文件，仅包含窗口生命周期、CLI/recorder 清理回调及其测试、使用文档。通过精确分块暂存，不混入 Mario 单关策略；未覆盖工作树里的其余修改。
+- `b268c2514b43727b39c2db7d6c0dfa6fae741c03` — `feat(recording): stop Mario episodes at the selected level boundary`；11 个文件，包含单关策略、录制/replay/append 联动与测试、state 使用说明。基于前一个 commit 保留 Mac 修复。
+
+提交前重新验证：独立 Mac-fix 源码快照的 recorder/CLI 测试 **21 passed in 0.77s**，GUI 测试 **19 passed in 5.50s**；完整组合源码的全量 CPU/Xvfb 回归 **210 passed in 97.62s**。本轮完整回归包含全部 GUI，没有跳过；所有 staged diff 空白检查通过。验证目录：`/tmp/stableretro-gitfix.NhKOje/`，完整记录为 `full.log`，独立 GUI 记录为 `candidate-gui.log`；临时副本和录制产物均未提交。
+
+代码正常 push 至既有 `origin`（`https://github.com/Chengshuai-Shi/game-agent.git`）的 `xr-sft` **失败**：HTTPS 无可用用户名/认证，非交互调用返回 `could not read Username ... terminal prompts disabled`。只读检查同一仓库的 SSH 访问也返回 `Permission denied (publickey)`。未修改 remote、凭据或 SSH 配置，没有 force push；不能把上述本地 commits 当作已经上传。
+
+本文件的第 13/14 节及本次 Mac 反馈在 `Stable-Retro` 的 `xr-gameagent-record` 分支单独提交；在本条记录写入时，其文档 push 尚待执行，以最终 Git 操作结果为准。`20260914_stableretro_local_recording_and_della_collection_working_note.md` 继续留在本地，未纳入此次提交。
