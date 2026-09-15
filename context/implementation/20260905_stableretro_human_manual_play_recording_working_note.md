@@ -934,3 +934,72 @@ sretro-validate "$gui_check_root/session" --replay --check-bk2 \
 代码正常 push 至既有 `origin`（`https://github.com/Chengshuai-Shi/game-agent.git`）的 `xr-sft` **失败**：HTTPS 无可用用户名/认证，非交互调用返回 `could not read Username ... terminal prompts disabled`。只读检查同一仓库的 SSH 访问也返回 `Permission denied (publickey)`。未修改 remote、凭据或 SSH 配置，没有 force push；不能把上述本地 commits 当作已经上传。
 
 本文件的第 13/14 节及本次 Mac 反馈在 `Stable-Retro` 的 `xr-gameagent-record` 分支单独提交；在本条记录写入时，其文档 push 尚待执行，以最终 Git 操作结果为准。`20260914_stableretro_local_recording_and_della_collection_working_note.md` 继续留在本地，未纳入此次提交。
+
+## 15. 2026-09-15（America/New_York）：外部 SMB 32 关 snapshot 的单关录制
+
+### 15.1 资产与交付范围
+
+用户提供 `/scratch/gpfs/CHIJ/xinran/projects/game-envalgm/game-agent-stableretro/rom/stable_retro/super_mario_bros`，要求使用其中的 32 个初始 state 录制指定关卡。目录包含完整的 `Level{1..8}-{1..4}.state`，覆盖 1-1 到 8-4。它是独立的外部 state bank，不是 Stable Retro 安装中的 12 个命名 state；不将两者的数量混为一谈。
+
+本次只修改既有 `game-agent-stagesft/Stable-retro/human_data_recording` 采集工具及本 working note。上述 bank 只读；没有复制、替换或重新生成 state，没有修改 ROM、integration、Stable Retro/Pyglet 安装、conda 环境或 `game-agent-stableretro` 的 RL/evaluation 实现。此工作仍使用 `stable-retro-recording`，不修改统一 RL 环境。
+
+### 15.2 实现选择与兼容性
+
+沿用已有 `--state-file PATH`，不新增 world/level 参数，不依赖固定 Della 路径，也不要求将外部 state 安装进 package：
+
+- `episode_boundary.policy_for_state()` 新增 keyword-only `state_file`。对 `SuperMarioBros-Nes-v0` 的外部 state，返回与命名 state 相同的 `smb1-nes-v1` policy。
+- `manual_play.py` 将 `args.state_file` 传入策略选择；加载后沿用现有 preflight、RecordingEnv、terminal 保存、Cocoa 安全退出、session/run 状态和 writer 清理流程。
+- `--stop-on-done` 下，通关、game over 或离开初始关卡后保存最后一条 transition、PNG/live state/BK2，结束并关闭窗口。掉命本身不结束；不额外 step/reset。
+- 不加 `--stop-on-done` 时，单关结束后 reset 回所选 snapshot，开始新的 episode，而不是继续下一关。
+- 完全不指定 `--state` / `--state-file` 时仍为默认 snapshot + 原 scenario 的不限关模式；其他游戏的外部 `--state-file` 保留既有 scenario 语义，不冒充具有单关适配器。其他游戏显式 `--state` 仍 fail-closed。
+- 两个初始化参数仍互斥。`--state Level1-2` 仍只查询安装中的命名 state，不自动搜索这个外部 bank；使用这些文件时应明确传 `--state-file`。
+
+**此节更新第 13/14 节关于 Mario `--state-file` 不启用单关策略的历史描述。** 不改变 detector 或 policy 版本，因为终止规则本身没有改变，只改变 CLI 的策略选择。旧外部 Mario session 若没有 policy，仍按旧规则 replay；不能把新单关录制 append 到旧不限关 session，程序会拒绝且不改写旧数据，需使用新 session。
+
+没有新增 schema：`initialization.kind=external_state`、`name` 保存实际 basename、`raw_sha256` 标识解压后的 reset 输入，`location.world/level/label` 从真实 reset 后 RAM 获取；session/run 保存 `episode_policy`，transitions 保存原有边界证据。数字文件名也不会被当作未知关卡或从名字猜测。每局 `initial.state` 归档 reset 输入，replay 不依赖原 bank 路径，但仍严格要求匹配的 ROM/core/native/runtime。
+
+32 个源 state 不是统一生命/角色/分数条件的承诺。例如本轮 spot-check 的 1-2、2-2 是 lives=2，8-4 是 lives=5；保留原始内容，不自动修改这些条件。Reset 仍按 Stable Retro 的原行为推进一帧 NOOP。
+
+### 15.3 验证计划与实际结果
+
+分层验证：选择逻辑与错误处理 → bank 全量 gzip/native/reset/录制/replay → GUI 代表关卡与真实通关回归。新增 `tests/test_external_mario_states.py`；32-state 输入通过 `SRETRO_SMB32_STATE_DIR` 显式传入，不将外部二进制 state 加入工具源码。未设置该变量时资产用例明确 skip；设置错误路径、缺文件或关卡不符会失败，不自动跳过。
+
+已完成：
+
+- **32/32**：gzip EOF/CRC、解压非空、native set_state 接受；pre-reset / post-reset 的真实 world/level 与文件名对应，并通过 unfinished-level preflight。
+- **32/32**：两个独立环境从同一 snapshot reset，RGB/RAM 完全一致。
+- **32/32**：真实 CLI 从该外部 state 录制 3 步，保存 4 PNG + 4 live states + initial.state + BK2；metadata 的文件名、raw hash、external kind、world/level、policy 正确；static、严格 replay、BK2 与每局一个抽样 replay-state initialization 检查通过。每个测试前后核对源文件 hash 不变。
+- 外部 Mario 多次 append、同名 state 内容改变拒绝、旧无 policy 外部 session replay 兼容/混写拒绝、其他游戏外部 state 旧语义，以及缺失文件、无效/空 gzip、已结束 state 和参数互斥均有回归测试。错误路径不创建录制 session。
+- 真实近旗杆 snapshot 来自正常 controller 轨迹；headless 与 GUI 均通过新 `--state-file` CLI 触发 `level_complete`，原生 done 仍为 false，无第二个 episode，terminal 数据与 replay/BK2/state 检查通过。没有强制 scenario done 冒充该通关。
+- 直接使用提供的 **1-2、2-2、8-4** 做 GUI/Xvfb 启动和有界保存（4 步，max_steps 退出），以及 static/replay/BK2/state 检查，均通过；同时启用 Cocoa-like 未初始化 loop fixture，确认没有重现退出 AttributeError。这三项是实际窗口启动/保存检查，不是这三个关卡已全部打通。
+
+完整非 GUI 验证按 state 资产扫描约定使用 CPU allocation：Slurm **13936603**，`cpu/chij`，1 task、2 CPU、4 GiB、time limit 10 分钟；节点 `della-i13n14`。实际 `COMPLETED`，exit `0:0`，elapsed `00:02:27`。解释器为 `/home/xl9353/.conda/envs/stable-retro-recording/bin/python`，未使用 GPU、训练任务或模型服务。最初普通沙箱中的 Slurm 只读查询因 socket 权限失败，已停止该查询，再通过获准的网络访问执行查询及有界验证。
+
+- 非 GUI 全量：**232 passed, 21 deselected in 144.16s**；包含全部 32-state 参数用例。
+- GUI 最终全量：**24 passed, 232 deselected in 11.72s**；是在新增上述 3 个 bank GUI 用例后重跑的最终结果。
+- 当前 **256 个测试用例全部覆盖通过**（232 非 GUI + 24 GUI）。代码 diff 空白检查通过。
+
+登录节点日志和 GUI 产物：`/tmp/stableretro-smb32-recording.wl5Zyv/`，核心日志为 `cpu-full.log`、`bank-gui.log`。CPU 的 session/replay 临时产物位于计算节点 **della-i13n14** 的 `/tmp/stableretro-smb32-cpu.HG6NSy/tests/`，不是登录节点的同名路径；这些临时产物不加入 Git。
+
+边界：尚未人工打通全部 32 关，也没有在 Mac 对这套外部 bank 做完整验收；不能把短录制和 RAM 标签一致当作所有复杂关卡/warp/城堡结束场景的全覆盖。现有 `level_changed` 仍是离开初始 world/level 的兜底边界，不一定代表成功通关。`--check-state-initialization` 检查 replay 导出的 states；录制时 live states 同时有静态完整性检查，两者不混淆。本轮没有 commit/push。
+
+### 15.4 使用示例：录制 World 1-2
+
+在可显示窗口的桌面环境、已更新采集工具的 conda 环境中运行；无需位于工具目录：
+
+```bash
+conda activate stable-retro-recording
+state_dir=/scratch/gpfs/CHIJ/xinran/projects/game-envalgm/game-agent-stableretro/rom/stable_retro/super_mario_bros
+sretro-record --game SuperMarioBros-Nes-v0 \
+  --state-file "$state_dir/Level1-2.state" \
+  --record-dir ./recordings/mario/world1-level2/session \
+  --append --stop-on-done --record-bk2
+```
+
+重复同一命令依次新增 episodes `000000`、`000001` 等。换到 2-2 时，将文件改为 `Level2-2.state`，同时将 session 改到 `world2-level2/session`；不要在同一个 session 中切换初始 state。
+
+```bash
+sretro-validate ./recordings/mario/world1-level2/session --replay --check-bk2
+```
+
+Mac 使用同样命令，但先将 bank 文件放在本机，将 `state_dir` 改为实际本地路径，并更新采集工具源码/安装包。无需重装 Stable Retro 或把 state 复制进安装目录；在产生录制的同一 runtime 做 replay 验证。包内 `assets/preloaded_states` 继续描述原 integration 的命名 state，不把该独立 bank 混入其中。
